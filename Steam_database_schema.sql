@@ -1,187 +1,132 @@
--- Creacion de base de datos
-CREATE DATABASE IF NOT EXISTS Steam_database;
+-- Steam database - DATA
 USE Steam_database;
--- Tabla principal: Videojuegos
-CREATE TABLE IF NOT EXISTS games (
-    app_id INT NOT NULL,
-    title VARCHAR(255) NOT NULL,
-    release_date VARCHAR(20) NULL,
-    positive_reviews INT NULL,
-    negative_reviews INT NULL,
-    min_owners INT NULL,
-    max_owners INT NULL,
-    PRIMARY KEY (app_id)
-);
--- Tabla de categorias asociadas a videojuegos
-CREATE TABLE IF NOT EXISTS game_categories (
-  app_id INT NOT NULL,
-  category VARCHAR(255) NOT NULL,
-  PRIMARY KEY (app_id, category),
-  CONSTRAINT fk_game_categories_game
-	FOREIGN KEY (app_id) REFERENCES games(app_id)
-);
--- Tabla de etiquetas asociadas a los videojuegos
-CREATE TABLE IF NOT EXISTS game_tags (
-  app_id INT NOT NULL,
-  tag VARCHAR(255) NOT NULL,
-  PRIMARY KEY (app_id, tag),
-  CONSTRAINT fk_game_tags_game
-	FOREIGN KEY (app_id) REFERENCES games(app_id)
-);
--- Tabla auditoria ligada a trigger
-CREATE TABLE IF NOT EXISTS games_audit (
-    audit_id INT AUTO_INCREMENT PRIMARY KEY,
-    app_id INT,
-    inserted_at DATETIME,
-    action_type VARCHAR(50)
-);
 
-DROP FUNCTION IF EXISTS fn_approval_percentage;
-DROP FUNCTION IF EXISTS fn_avg_owners;
-DELIMITER $$
+-- Limpieza en orden correcto (por FK)
+DELETE FROM game_type_map;
+DELETE FROM game_types;
+DELETE FROM game_trends;
+DELETE FROM game_metrics;
+DELETE FROM game_tags;
+DELETE FROM game_categories;
+DELETE FROM games;
 
-CREATE FUNCTION fn_approval_percentage(
-    pos INT,
-    neg INT
+-- Carga de tabla "games"
+LOAD DATA INFILE 'C:/ProgramData/MySQL/MySQL Server 9.5/Uploads/games.csv'
+INTO TABLE games
+FIELDS TERMINATED BY ','
+ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 ROWS
+(@name, @month, @year, @release_date, @price, @positive_rev, @negative_rev, @app_id, @min_owners, @max_owners, @hltb_single)
+SET
+app_id = @app_id,
+title = @name,
+release_date = @release_date,
+positive_reviews = @positive_rev,
+negative_reviews = @negative_rev,
+min_owners = @min_owners,
+max_owners = @max_owners;
+
+-- Carga de tabla "game_tags"
+LOAD DATA INFILE 'C:/ProgramData/MySQL/MySQL Server 9.5/Uploads/t-games-tags.csv'
+INTO TABLE game_tags
+FIELDS TERMINATED BY ','
+ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 ROWS
+(app_id, tag);
+
+-- Carga de tabla "game_categories"
+-- Nota para esta tabla:
+-- La tabla game_categories no se cargó mediante LOAD DATA INFILE
+-- debido a limitaciones del entorno y errores del cliente (Workbench).
+-- Se insertaron registros manualmente para permitir pruebas de relaciones.
+
+-- Poblacion de tabla de metricas
+INSERT INTO game_metrics (
+    app_id,
+    total_reviews,
+    avg_owners,
+    approval_percentage
 )
-RETURNS DECIMAL(5,2)
-DETERMINISTIC
-BEGIN
-    DECLARE total INT;
-    DECLARE result DECIMAL(5,2);
-
-    SET total = pos + neg;
-
-    IF total = 0 THEN
-        RETURN 0;
-    END IF;
-
-    SET result = (pos / total) * 100;
-
-    RETURN ROUND(result,2);
-END $$
-
-CREATE FUNCTION fn_avg_owners(
-    min_val INT,
-    max_val INT
-)
-RETURNS INT
-DETERMINISTIC
-BEGIN
-    RETURN (min_val + max_val) / 2;
-END $$
-DELIMITER ;
-
--- Vista 1: Juegos con mejor aprobacion
-DROP VIEW IF EXISTS view_game_approval;
-CREATE OR REPLACE VIEW view_game_approval AS
 SELECT
     app_id,
-    title,
-    release_date,
-    positive_reviews,
-    negative_reviews,
     (positive_reviews + negative_reviews) AS total_reviews,
+    fn_avg_owners(min_owners, max_owners) AS avg_owners,
     fn_approval_percentage(positive_reviews, negative_reviews) AS approval_percentage
-FROM games
-WHERE (positive_reviews + negative_reviews) >= 10000;
+FROM games;
 
--- Vista 2: Juegos mas relevantes del mercado
-DROP VIEW IF EXISTS view_market_relevance;
-CREATE OR REPLACE VIEW view_market_relevance AS
+-- Poblacion tabla de tendencias
+INSERT INTO game_trends (
+    app_id,
+    trend_score,
+    popularity_level,
+    success_level
+)
 SELECT
     app_id,
-    title,
-    release_date,
-    min_owners,
-    max_owners,
-    (positive_reviews + negative_reviews) AS total_reviews,
-    fn_approval_percentage(positive_reviews, negative_reviews) AS approval_percentage
-FROM games
-WHERE 
-    (positive_reviews + negative_reviews) >= 10000
-    AND min_owners >= 100000;
-        
-    -- Stored procedure #1: Juegos con mejor aprobacion
-DROP PROCEDURE IF EXISTS sp_games_by_market_criteria;     
-DELIMITER $$
-CREATE PROCEDURE sp_games_by_market_criteria(
-    IN min_reviews INT,
-    IN min_owners_param INT
-)
-BEGIN
-    SELECT
-        app_id,
-        title,
-        release_date,
-        min_owners,
-        max_owners,
-        (positive_reviews + negative_reviews) AS total_reviews,
-        fn_approval_percentage(positive_reviews, negative_reviews) AS approval_percentage
-    FROM games
-    WHERE 
-        (positive_reviews + negative_reviews) >= min_reviews
-        AND min_owners >= min_owners_param
-    ORDER BY approval_percentage DESC;
-END $$
-DELIMITER ;
+    ROUND(
+        (
+            (approval_percentage * 0.6)
+            +
+            (LOG10(GREATEST(total_reviews, 1)) * 5 * 0.25)
+            +
+            (LOG10(GREATEST(avg_owners, 1)) * 5 * 0.15)
+        ),
+        2
+    ) AS trend_score,
 
--- Stored procedure #2: Top juegos por ventas
-DROP PROCEDURE IF EXISTS sp_top_games_by_market;
-DELIMITER $$
-CREATE PROCEDURE sp_top_games_by_market(
-    IN limit_number INT
-)
-BEGIN
-    SELECT
-        app_id,
-        title,
-        fn_avg_owners(min_owners, max_owners) AS avg_estimated_owners,
-        fn_approval_percentage(positive_reviews, negative_reviews) AS approval_percentage,
-        (positive_reviews + negative_reviews) AS total_reviews
-    FROM games
-    WHERE (positive_reviews + negative_reviews) >= 10000
-    ORDER BY avg_estimated_owners DESC
-    LIMIT limit_number;
-END $$
-DELIMITER ;
+    CASE
+        WHEN avg_owners < 50000 THEN 'Low'
+        WHEN avg_owners < 200000 THEN 'Medium'
+        ELSE 'High'
+    END AS popularity_level,
 
-DROP TRIGGER IF EXISTS trg_before_insert_games_validation;
-DROP TRIGGER IF EXISTS trg_after_insert_games_audit;
-DELIMITER $$
+    CASE
+        WHEN approval_percentage < 60 THEN 'Poor'
+        WHEN approval_percentage < 80 THEN 'Good'
+        ELSE 'Excellent'
+    END AS success_level
 
-CREATE TRIGGER trg_before_insert_games_validation
-BEFORE INSERT ON games
-FOR EACH ROW
-BEGIN
-    IF NEW.positive_reviews < 0 OR NEW.negative_reviews < 0 THEN
-        SIGNAL SQLSTATE '45000'
-        SET MESSAGE_TEXT = 'Reviews cannot be negative';
-    END IF;
-END $$
+FROM game_metrics;
 
-CREATE TRIGGER trg_after_insert_games_audit
-AFTER INSERT ON games
-FOR EACH ROW
-BEGIN
-    INSERT INTO games_audit (
-        app_id,
-        inserted_at,
-        action_type
-    )
-    VALUES (
-        NEW.app_id,
-        NOW(),
-        'INSERT'
-    );
-END $$
+-- Clasificacion por mercado
+-- Tipos de mercado
+INSERT INTO game_types (type_id, type_name)
+VALUES
+(1, 'Niche'),
+(2, 'Mid Market'),
+(3, 'High Market');
 
-DELIMITER ;
+-- Asignación de juegos a tipos
+INSERT INTO game_type_map (app_id, type_id)
+SELECT
+    app_id,
+    CASE
+        WHEN avg_owners < 50000 THEN 1
+        WHEN avg_owners < 200000 THEN 2
+        ELSE 3
+    END
 
-SHOW FUNCTION STATUS WHERE Db = 'Steam_database';
+FROM game_metrics;
 
-SHOW TABLES;
+-- Validaciones finales
+-- Validar carga de juegos
+SELECT COUNT(*) AS total_games FROM games;
 
-SHOW TRIGGERS;
+-- Validar métricas generadas
+SELECT COUNT(*) AS total_metrics FROM game_metrics;
 
-SHOW DATABASES;
+-- Validar tendencias generadas
+SELECT COUNT(*) AS total_trends FROM game_trends;
+
+-- Validar clasificación por mercado
+SELECT 
+    gt.type_name,
+    COUNT(*) AS total_games
+FROM game_type_map gtm
+JOIN game_types gt ON gtm.type_id = gt.type_id
+GROUP BY gt.type_name;
+
+-- Mostrar análisis final
+SELECT * FROM view_trends_by_market;
